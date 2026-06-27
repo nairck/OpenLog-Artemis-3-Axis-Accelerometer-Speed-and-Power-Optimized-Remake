@@ -182,6 +182,7 @@ void setup() {
   rateRingIdx = 0; rateRingCount = 0;                 // fresh live-rate estimate
   // Event engine + flash state to a clean armed/idle baseline.
   selfActive = false; recordingPrev = false; selfPostUntil = micros();
+  partnerActiveSince = 0; partnerStuckLatched = false;
   evPartnerInWindow = false; afterFlashOn = false; hsFlashRunning = false;
   evHead = 0; evCapStart = 0; evCapLen = 0;
   hpLpAx = (int32_t)rawAx << 16; hpLpAy = (int32_t)rawAy << 16; hpLpAz = (int32_t)rawAz << 16;

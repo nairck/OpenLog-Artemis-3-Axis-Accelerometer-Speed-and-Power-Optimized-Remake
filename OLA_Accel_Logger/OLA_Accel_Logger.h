@@ -77,7 +77,7 @@ struct Settings {
   int      imuAccDLPFBW          = 7;
   bool     recordEventsOnly      = true;          // event-triggered capture
   uint32_t eventWindowMs         = 3000;          // total window saved (20/80 split)
-  float    eventThreshMg         = 1000.0f;       // mg; deviation from 1g that triggers (0.1-16000)
+  float    eventThreshMg         = 1500.0f;       // mg; deviation from Xg that triggers (0.1-16000)
   uint8_t  evPrePct              = 20;            // pre-event % of window (2-98, default 20)
   uint32_t openNewLogFilesAfter  = 86400;         // s; min=60; max=604800 (1 wk)
   uint32_t maxLogFileBytes       = 1000000000UL;  // bytes; min 25KB; max 3.8 GB
@@ -181,6 +181,18 @@ static uint32_t selfPostUntil     = 0;
 static uint32_t evPreWindowUs     = 800000UL;    // pre-event span (evPrePct of window), us, cached
 static uint32_t evPostWindowUs    = 3200000UL;   // post-event span (rest of window), us, cached
 static uint32_t evMagHigh2        = 4194304UL;   // thresh in raw^2, cached
+
+// Partner-active watchdog: micros() at which the current PARTNER-driven recording
+// began (set when a window opens with the partner involved but our own threshold
+// is not the driver). If a window is held open purely by the partner line for
+// longer than PARTNER_STUCK_US - e.g. the partner unit hangs or loses power with
+// its TRIG_OUT stuck HIGH, or the wire shorts high - we force the partner
+// contribution to drop so this unit can close its window and re-arm. A genuine
+// shared event is far shorter than this cap and also fires our own threshold, so
+// real captures are never truncated. Reset whenever the partner line is LOW.
+#define PARTNER_STUCK_US 60000000UL              // 60 s hard cap on partner-only recording
+static uint32_t partnerActiveSince = 0;          // micros() when partner-only recording began
+static bool     partnerStuckLatched = false;     // true once we've forced-dropped a stuck partner
 
 // Cross-trigger partner link runtime state.
 static bool     partnerSeen       = false;       // sticky: a partner HIGH has been seen (set in ISR)
@@ -709,33 +721,59 @@ static void eventModeStep(uint32_t M) {
   // --- Partner input (active high) - honoured only in AUTO mode ------------
   bool partnerActive = pAuto && partnerLineHigh && !inHold && (partnerPulseCount == 0);  // a pairing TOGGLE sets partnerPulseCount; never let it open a partner window
 
+  // Stuck-partner watchdog. If the partner line is held HIGH continuously for
+  // longer than PARTNER_STUCK_US AND our own threshold is not the thing keeping
+  // the window open, treat the partner line as faulty (hung/dead partner, or a
+  // wire stuck high) and force its contribution off until it genuinely returns
+  // LOW. This guarantees a window can never be held open forever by the partner.
+  if (!partnerLineHigh) {
+    partnerActiveSince = 0; partnerStuckLatched = false;       // line released: clear watchdog
+  } else if (partnerActive && !selfActive) {
+    if (partnerActiveSince == 0) partnerActiveSince = M;       // start timing partner-only recording
+    else if (!partnerStuckLatched
+             && (uint32_t)(M - partnerActiveSince) > PARTNER_STUCK_US) {
+      partnerStuckLatched = true;                              // exceeded cap: declare the line stuck
+    }
+  } else if (selfActive) {
+    partnerActiveSince = 0;                                    // our own event drives the window; not partner-only
+  }
+  if (partnerStuckLatched) partnerActive = false;             // ignore a stuck partner until it drops LOW
+
   // --- Record while EITHER our own event OR the partner's is live ----------
   bool recordingNow = selfActive || partnerActive;
 
   if (recordingNow) {
     if (!recordingPrev) evPartnerInWindow = false;            // new window opens
     if (partnerActive)  evPartnerInWindow = true;             // mark partner involvement
-    // Ring full mid-event, OR a sampling gap too big for a uint16 delta (bigGap):
-    // drop our trig-out LOW while the (blocking) SD write runs - a following
-    // partner sees the window boundary - flush what we have (own DAY marker), then
-    // raise trig-out again as the window continues in a fresh chunk.
-    if (evCapLen >= EVENT_RING_SAMPLES || bigGap) {
-      bool drove = selfActive && pAuto;                       // were WE driving the line?
-      if (drove) trigOutLow();
+    // Two distinct conditions force a chunk boundary mid-window, and they need
+    // OPPOSITE store/flush orders. Neither branch touches selfActive or TRIG_OUT:
+    // the own-window lifetime is owned SOLELY by the post-window timer above
+    // (selfPostUntil). TRIG_OUT stays exactly as-is (HIGH while we drive) across the
+    // blocking write - a partner never sees a spurious edge mid-flush - and the own
+    // window ends only when that timer expires, never because one sample landing on
+    // a flush boundary happened to fall below threshold (which would truncate the
+    // post-window tail to a stray 1-sample chunk).
+    if (bigGap) {
+      // A real >65 ms hole since the last stored sample (e.g. the gap the blocking
+      // SD write itself leaves). The pre-gap samples must be flushed as their own
+      // chunk BEFORE evStore runs, because evStore() resets evCapStart on a >0xFFFF
+      // delta and would otherwise abandon them unflushed. M then starts a fresh
+      // post-gap chunk with its own DAY marker - which is the correct record of a
+      // genuine gap.
       evDumpChunk();
       evCapStart = evHead; evCapLen = 0;
-      // After flush: re-check threshold (using 'over' from this sample, already
-      // computed before the flush). If the shock has subsided, end our own event
-      // immediately rather than extending into another full ring fill. Partner
-      // input is still honoured independently via partnerActive.
-      if (!over) {
-        selfActive = false;                                   // our event ends now
-        // trig-out already LOW; let the close path fire on the next sample
-      } else {
-        if (drove) trigOutHigh();                             // shock persists: resume signalling
-      }
+      evStore(M);                                             // M = first sample of the new post-gap chunk
+    } else if (evCapLen >= EVENT_RING_SAMPLES - 1) {
+      // Ring about to fill with a CONTIGUOUS sample. Store M FIRST so it rides with
+      // this chunk (no stranded 1-sample chunk on the next sample), but trigger one
+      // sample early so storing lands evCapLen at exactly EVENT_RING_SAMPLES - never
+      // RING+1, which would overwrite the oldest slot and corrupt the flush.
+      evStore(M);                                             // evCapLen -> EVENT_RING_SAMPLES
+      evDumpChunk();
+      evCapStart = evHead; evCapLen = 0;
+    } else {
+      evStore(M);
     }
-    evStore(M);
   } else if (recordingPrev) {
     // Window just closed (own post-window elapsed AND partner LOW): final flush.
     // Our trig-out is already LOW here (selfActive went false), so no line drop.
@@ -1072,6 +1110,7 @@ static void handlePartnerConnect() {
   if (selfActive && evCapLen > 0) evDumpChunk();
   evCapStart = evHead; evCapLen = 0;
   selfActive = false; recordingPrev = false; evPartnerInWindow = false;
+  partnerActiveSince = 0; partnerStuckLatched = false;
   trigOutLow();
 
   uint64_t completeRaw = hsRespond();
@@ -1487,8 +1526,9 @@ static void menuEventMode() {
     else if (c == 'g') {
       Serial.println(F("\r\n-- Event threshold --"));
       Serial.print(F("  Current: ")); Serial.print(settings.eventThreshMg, 1); Serial.println(F(" mg"));
-      Serial.println(F("  Trigger when |a| deviates from 1g (rest) by this much."));
-      Serial.println(F("  1000 = 1.0 g -> fires on |a| > 2g."));
+      Serial.println(F("  Trigger when |a| deviates from rest by this much (|a|=sqrt(ax^2 + ay^2 + az^2)."));
+      Serial.println(F("  |a| check is high-pass filtered (2s time constant) to remove bias like gravity."));
+      Serial.println(F("  For example: Threshold = 1000 (= 1.0 g) -> fires on |a| > 1g."));
       Serial.print(F("  ")); Serial.print(MIN_THRESH_MG, 1); Serial.print(F(" mg min, "));
       Serial.print(MAX_THRESH_MG, 0); Serial.println(F(" mg max (16g full-scale)."));
       Serial.println(F("\r\n  Type mg (decimal OK) + Enter, or x to cancel:"));
@@ -1735,6 +1775,7 @@ void menuMain() {
   // Re-arm the event engine and the cross-trigger output for a clean restart.
   selfActive = false; recordingPrev = false; selfPostUntil = micros();
   evCapStart = evHead; evCapLen = 0; evPartnerInWindow = false;
+  partnerActiveSince = 0; partnerStuckLatched = false;
   trigOutLow();
   if (partnerAuto()) partnerLineHigh = (digitalRead(PIN_TRIG_IN) == HIGH);  // resync line
   partnerHsPulse = false; partnerPulseCount = 0;            // drop any stale pairing pulse
