@@ -122,8 +122,9 @@ continuously, it watches for shocks and saves just the part that matters:
 the **lead-up before the trigger** (the pre-split, default 20%) as well as the
 **aftermath** (default 80%). If more shocks land inside the tail of the window, it
 **extends** so you always get quiet after the last one. Samples that hit the sensor's
-full-scale limit are flagged for analysis. Shown configured to a 4 s window: 800 ms before
-+ 3.2 s after.*
+full-scale limit are flagged for analysis. Shown configured to a 4 s window: 800 ms before + 3.2 s after.*
+
+If an event runs long enough to fill the rolling buffer, the logger flushes it to the SD card and resumes as fast as it can — a single pause of ~2 s at 48 MHz or ~1 s at 96 MHz — then keeps capturing in a fresh chunk. That flush is the price of gap-free sampling across a large buffer: it holds ~7 s at 5.4 kHz or ~12 s at 3.2 kHz (slower sampling fits more time), while the flush duration stays fixed. An event that lands during the flush can be missed, but logging will trigger as soon as it can to catch the tail of the event window.
 
 In plain terms:
 
